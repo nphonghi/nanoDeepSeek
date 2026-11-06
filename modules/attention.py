@@ -115,27 +115,45 @@ class MultiHeadLatentAttention(nn.Module):
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope_expanded], dim=-1)
         
-        # Scaled Dot-Product Attention with FlashAttention / PyTorch SDPA kernel
-        if L > 1 and past_len > 0:
-            # Chunked decoding with past cache: explicit causal mask
-            q_idx = torch.arange(L, device=x.device).unsqueeze(1)
-            k_idx = torch.arange(total_len, device=x.device).unsqueeze(0)
-            causal_mask = (k_idx <= (past_len + q_idx)).unsqueeze(0).unsqueeze(0)
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=causal_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
+        # Scaled Dot-Product Attention
+        # PyTorch MPS backend has an internal Metal kernel issue when qk_head_dim != v_head_dim.
+        # Fall back to exact dot-product attention when running on MPS or when head dimensions differ.
+        dropout_p = self.dropout.p if self.training else 0.0
+        if x.device.type == "mps" or q.size(-1) != v.size(-1):
+            scale = 1.0 / math.sqrt(q.size(-1))
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if L > 1 and past_len > 0:
+                q_idx = torch.arange(L, device=x.device).unsqueeze(1)
+                k_idx = torch.arange(total_len, device=x.device).unsqueeze(0)
+                causal_mask = (k_idx <= (past_len + q_idx)).unsqueeze(0).unsqueeze(0)
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
+            elif (L > 1) and (past_len == 0):
+                mask = torch.tril(torch.ones(L, L, device=x.device, dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
+                scores = scores.masked_fill(~mask, float("-inf"))
+            probs = F.softmax(scores, dim=-1)
+            if dropout_p > 0.0:
+                probs = F.dropout(probs, p=dropout_p)
+            attn_out = torch.matmul(probs, v)
         else:
-            # When L == 1 and past_len > 0: current token attends to all historical tokens (is_causal=False)
-            # When L > 1 and past_len == 0: prefill/training causal attention (is_causal=True)
-            is_causal = (L > 1) and (past_len == 0)
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                is_causal=is_causal,
-                dropout_p=self.dropout.p if self.training else 0.0,
-            )
-        
+            if L > 1 and past_len > 0:
+                # Chunked decoding with past cache: explicit causal mask
+                q_idx = torch.arange(L, device=x.device).unsqueeze(1)
+                k_idx = torch.arange(total_len, device=x.device).unsqueeze(0)
+                causal_mask = (k_idx <= (past_len + q_idx)).unsqueeze(0).unsqueeze(0)
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=causal_mask,
+                    dropout_p=dropout_p,
+                )
+            else:
+                # Prefill or single-token decoding
+                is_causal = (L > 1) and (past_len == 0)
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    is_causal=is_causal,
+                    dropout_p=dropout_p,
+                )
+
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.num_heads * self.v_head_dim)
         out = self.o_proj(attn_out)
         return out, present_key_value

@@ -30,6 +30,14 @@ def get_cosine_scheduler(optimizer, warmup_steps: int, max_steps: int, min_lr: f
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins}m {secs:02d}s"
+
+
 @torch.no_grad()
 def estimate_loss(model: NanoDeepSeek, train_cfg: TrainConfig, device: torch.device):
     out = {}
@@ -57,28 +65,16 @@ def train():
 
     # Training and model configurations
     train_cfg = TrainConfig(
-        batch_size=32,
-        block_size=64,
-        max_steps=150,
+        batch_size=16,
+        block_size=128,
+        max_steps=200,
         warmup_steps=20,
-        learning_rate=1e-3,
+        learning_rate=5e-4,
         eval_interval=50,
         eval_steps=10,
     )
 
-    model_cfg = ModelConfig(
-        vocab_size=vocab_size,
-        hidden_size=128,
-        num_hidden_layers=4,
-        max_position_embeddings=256,
-        num_attention_heads=4,
-        head_dim=32,
-        kv_lora_rank=32,
-        q_lora_rank=48,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=16,
-        v_head_dim=32,
-    )
+    model_cfg = ModelConfig(vocab_size=vocab_size)
 
     # Instantiate NanoDeepSeek model
     model = NanoDeepSeek(model_cfg).to(device)
@@ -104,6 +100,7 @@ def train():
     # Main pretraining iteration loop
     model.train()
     start_time = time.time()
+    print("Starting training loop...", flush=True)
 
     for step in range(1, train_cfg.max_steps + 1):
         t0 = time.time()
@@ -122,17 +119,35 @@ def train():
         optimizer.step()
         scheduler.step()
 
-        # Track throughput metrics
+        # Track throughput metrics and progress display
         dt = time.time() - t0
         tokens_per_sec = (train_cfg.batch_size * train_cfg.block_size) / max(1e-6, dt)
+        remaining_steps = train_cfg.max_steps - step
+        eta = remaining_steps * dt
 
-        if step % 25 == 0:
-            lr = scheduler.get_last_lr()[0]
-            aux_loss = outputs["aux_loss"].item()
-            print(f"Step {step:4d}/{train_cfg.max_steps} | Loss: {loss.item():.4f} | MoE Aux: {aux_loss:.4f} | LR: {lr:.2e} | {dt*1000:.1f}ms | {tokens_per_sec:.0f} tok/s", flush=True)
+        # Visual progress bar rendering
+        bar_len = 20
+        progress = step / train_cfg.max_steps
+        filled = int(bar_len * progress)
+        bar = "=" * filled + (">" if filled < bar_len else "") + "." * (bar_len - filled - (1 if filled < bar_len else 0))
+        lr = scheduler.get_last_lr()[0]
+        aux_loss = outputs["aux_loss"].item()
+
+        progress_str = (
+            f"\r[{bar}] {progress * 100:5.1f}% | "
+            f"Step {step:3d}/{train_cfg.max_steps} | "
+            f"Loss: {loss.item():.4f} | "
+            f"Aux: {aux_loss:.4f} | "
+            f"{tokens_per_sec:4.0f} tok/s | "
+            f"ETA: {format_time(eta)}"
+        )
+        sys.stdout.write(progress_str)
+        sys.stdout.flush()
 
         # Validation evaluation and text generation check
         if step % train_cfg.eval_interval == 0 or step == train_cfg.max_steps:
+            sys.stdout.write("\n")
+            print(f"[Step {step}] Evaluating on validation set...", flush=True)
             losses = estimate_loss(model, train_cfg, device)
             print(f"Validation loss: train {losses['train']:.4f}, val {losses['val']:.4f}", flush=True)
 
@@ -143,6 +158,7 @@ def train():
             print(f"Generated text sample:\n{decode(gen_ids[0].tolist())}\n", flush=True)
             model.train()
 
+    sys.stdout.write("\n")
     print(f"Training completed in {time.time() - start_time:.1f} seconds", flush=True)
 
     # Save trained base model checkpoint for downstream fine-tuning and inference

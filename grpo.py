@@ -34,19 +34,7 @@ def grpo_demo():
     print(f"Running GRPO demo on device: {device}")
 
     # Model architecture configuration
-    model_cfg = ModelConfig(
-        vocab_size=vocab_size,
-        hidden_size=128,
-        num_hidden_layers=4,
-        max_position_embeddings=256,
-        num_attention_heads=4,
-        head_dim=32,
-        kv_lora_rank=32,
-        q_lora_rank=48,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=16,
-        v_head_dim=32,
-    )
+    model_cfg = ModelConfig(vocab_size=vocab_size)
 
     # Policy model to optimize and frozen reference model for KL divergence penalty
     policy_model = NanoDeepSeek(model_cfg).to(device)
@@ -60,10 +48,20 @@ def grpo_demo():
             break
 
     if init_checkpoint is not None:
-        policy_model.load_state_dict(torch.load(init_checkpoint, map_location=device))
-        print(f"Loaded policy model weights from {init_checkpoint.name}")
+        state_dict = torch.load(init_checkpoint, map_location=device)
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            if "lora_A" in k or "lora_B" in k:
+                continue
+            new_k = k.replace(".base_layer.weight", ".weight")
+            cleaned_state_dict[new_k] = v
+        policy_model.load_state_dict(cleaned_state_dict)
+        if init_checkpoint.name == "lora_model.pt":
+            print(f"Loaded fine-tuned model weights from {init_checkpoint.name} (LoRA -> GRPO)")
+        else:
+            print(f"Loaded base model weights from {init_checkpoint.name} (lora_model.pt not found, running Base -> GRPO)")
     else:
-        print("No pretrained checkpoint found, starting from random initialization")
+        print("Warning: Neither lora_model.pt nor base_model.pt found, starting from random initialization")
 
     ref_model = copy.deepcopy(policy_model).to(device)
     ref_model.eval()
@@ -90,6 +88,9 @@ def grpo_demo():
         responses = []
         response_texts = []
         rewards = []
+
+        sys.stdout.write(f"\rGRPO Step {step:2d}/10 | Generating {group_size} rollouts...")
+        sys.stdout.flush()
 
         # Rollout: Generate a group of G responses for the exact same prompt
         with torch.no_grad():
@@ -156,9 +157,10 @@ def grpo_demo():
         torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
         optimizer.step()
 
-        print(f"GRPO Step {step:2d} | Avg Reward: {mean_r.item():.2f} | Loss: {total_loss.item():.4f}")
+        sys.stdout.write(f"\rGRPO Step {step:2d}/10 | Avg Reward: {mean_r.item():.2f} | Loss: {total_loss.item():.4f}\n")
+        sys.stdout.flush()
         if step % 5 == 0:
-            print(f"Sample response: {repr(response_texts[0][:40])} (Reward: {rewards[0]:.1f})")
+            print(f"Sample response: {repr(response_texts[0][:40])} (Reward: {rewards[0]:.1f})", flush=True)
 
     print("\nGRPO training loop completed successfully")
 

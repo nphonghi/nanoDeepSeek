@@ -81,6 +81,16 @@ def mark_only_lora_as_trainable(model: nn.Module) -> None:
             param.requires_grad = False
 
 
+def merge_and_unload_lora(model: nn.Module) -> nn.Module:
+    # Merge adapter weights into base linear layers and unwrap LoRALinear modules
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if isinstance(child, LoRALinear):
+                child.merge_weights()
+                setattr(module, child_name, child.base_layer)
+    return model
+
+
 def print_trainable_parameters(model: nn.Module) -> None:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())

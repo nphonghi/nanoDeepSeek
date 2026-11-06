@@ -10,25 +10,28 @@ All core architectural building blocks are separated into dedicated, modular fil
 
 ```text
 nanoDeepSeek/
+├── .gitignore          # Git ignore rules (checkpoints, caches, virtual environments)
+├── requirements.txt    # Minimal environment dependencies (torch, numpy)
 ├── config.py           # Configuration classes (ModelConfig, MoEConfig, MTPConfig, LoRAConfig)
+├── model.py            # TransformerBlock assembly and full NanoDeepSeek model
 ├── modules/            # Separated architectural building blocks
+│   ├── __init__.py     # Module exports
 │   ├── norm.py         # RMSNorm (Root Mean Square Normalization)
 │   ├── rope.py         # Rotary Position Embedding (RoPE)
 │   ├── attention.py    # Multi-Head Latent Attention (MLA) with low-rank KV compression & decoupled RoPE
 │   ├── moe.py          # DeepSeekMoE (Shared experts, routed experts, top-k gate, aux loss)
 │   ├── mtp.py          # Multi-Token Prediction (MTP head for multi-step ahead prediction)
-│   └── lora.py         # Native PyTorch LoRA adapter (LoRALinear, apply_lora, merge_weights)
-├── model.py            # TransformerBlock assembly and full NanoDeepSeek model
-├── data.py             # Memory-mapped binary token data loader
+│   └── lora.py         # Native PyTorch LoRA adapter (LoRALinear, apply_lora, merge_and_unload_lora)
+├── data/               # Pre-tokenized dataset package
+│   ├── __init__.py     # Memory-mapped binary token data loader & batching
+│   ├── prepare.py      # Pre-tokenizes corpus into binary token files (uint16)
+│   ├── train.bin       # Binary encoded training tokens (git ignored)
+│   ├── val.bin         # Binary encoded validation tokens (git ignored)
+│   └── meta.pkl        # Character vocabulary mapping metadata (git ignored)
 ├── train.py            # Pretraining script with validation loss estimation & text sampling
 ├── train_lora.py       # LoRA fine-tuning script freezing base weights and merging adapters
-├── generate.py         # Text generation with MTP speculative decoding
 ├── grpo.py             # DeepSeek-R1 Group Relative Policy Optimization alignment demo
-└── data/
-    ├── prepare.py      # Pre-tokenizes corpus into binary token files (uint16)
-    ├── train.bin       # Binary encoded training tokens
-    ├── val.bin         # Binary encoded validation tokens
-    └── meta.pkl        # Character vocabulary mapping metadata
+└── generate.py         # Text generation with MTP speculative decoding
 ```
 
 ---

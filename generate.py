@@ -82,19 +82,7 @@ def main():
     print(f"Running generation demo on device: {device}")
 
     # Instantiate NanoDeepSeek model configuration
-    model_cfg = ModelConfig(
-        vocab_size=vocab_size,
-        hidden_size=128,
-        num_hidden_layers=4,
-        max_position_embeddings=256,
-        num_attention_heads=4,
-        head_dim=32,
-        kv_lora_rank=32,
-        q_lora_rank=48,
-        qk_nope_head_dim=16,
-        qk_rope_head_dim=16,
-        v_head_dim=32,
-    )
+    model_cfg = ModelConfig(vocab_size=vocab_size)
     model = NanoDeepSeek(model_cfg).to(device)
 
     # Load latest available model checkpoint in the pipeline: R1 > LoRA > Base
@@ -106,7 +94,14 @@ def main():
             break
 
     if checkpoint_found is not None:
-        model.load_state_dict(torch.load(checkpoint_found, map_location=device))
+        state_dict = torch.load(checkpoint_found, map_location=device)
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            if "lora_A" in k or "lora_B" in k:
+                continue
+            new_k = k.replace(".base_layer.weight", ".weight")
+            cleaned_state_dict[new_k] = v
+        model.load_state_dict(cleaned_state_dict)
         print(f"Loaded model checkpoint from {checkpoint_found.name}")
     else:
         print("No trained checkpoint found, running with randomly initialized weights")

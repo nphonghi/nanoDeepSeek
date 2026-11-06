@@ -4,16 +4,15 @@ from pathlib import Path
 from typing import Tuple, List
 import torch
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+from .prepare import prepare
+
+DATA_DIR = Path(__file__).resolve().parent
 TRAIN_BIN_PATH = DATA_DIR / "train.bin"
 VAL_BIN_PATH = DATA_DIR / "val.bin"
 META_PATH = DATA_DIR / "meta.pkl"
 
 # Prepare binary token files if not present
 if not TRAIN_BIN_PATH.exists() or not VAL_BIN_PATH.exists() or not META_PATH.exists():
-    import sys
-    sys.path.insert(0, str(DATA_DIR))
-    from prepare import prepare
     prepare()
 
 # Load vocabulary metadata
@@ -69,3 +68,4 @@ except ImportError:
         x = torch.stack([source[i : i + block_size] for i in ix])
         y = torch.stack([source[i + 1 : i + 1 + block_size] for i in ix])
         return x.to(device), y.to(device)
+

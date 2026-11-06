@@ -3,7 +3,13 @@ from .rope import RotaryEmbedding, apply_rotary_pos_emb
 from .attention import MultiHeadLatentAttention
 from .moe import DeepSeekMoE, SwiGLU, MoEGate
 from .mtp import MTPHead
-from .lora import LoRALinear, apply_lora, mark_only_lora_as_trainable, print_trainable_parameters
+from .lora import (
+    LoRALinear,
+    apply_lora,
+    mark_only_lora_as_trainable,
+    print_trainable_parameters,
+    merge_and_unload_lora,
+)
 
 __all__ = [
     "RMSNorm",
@@ -18,4 +24,5 @@ __all__ = [
     "apply_lora",
     "mark_only_lora_as_trainable",
     "print_trainable_parameters",
+    "merge_and_unload_lora",
 ]

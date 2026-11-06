@@ -5,12 +5,12 @@ from typing import Optional, List
 @dataclass
 class MoEConfig:
     enabled: bool = True
-    num_experts: int = 4
-    num_experts_per_tok: int = 1
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
     num_shared_experts: int = 1
-    expert_hidden_size: int = 256
+    expert_hidden_size: int = 1024
     aux_loss_weight: float = 0.01
-    aux_loss_free: bool = False  # Set to True for DeepSeek-V3 auxiliary-loss-free load balancing
+    aux_loss_free: bool = False
     bias_update_rate: float = 0.001
 
 
@@ -35,20 +35,20 @@ class LoRAConfig:
 @dataclass
 class ModelConfig:
     vocab_size: int = 65
-    hidden_size: int = 128
-    num_hidden_layers: int = 4
-    max_position_embeddings: int = 256
+    hidden_size: int = 512
+    num_hidden_layers: int = 8
+    max_position_embeddings: int = 512
     
-    num_attention_heads: int = 4
-    head_dim: int = 32
-    kv_lora_rank: int = 32
-    q_lora_rank: int = 48
-    qk_nope_head_dim: int = 16
-    qk_rope_head_dim: int = 16
-    v_head_dim: int = 32
+    num_attention_heads: int = 8
+    head_dim: int = 64
+    kv_lora_rank: int = 128
+    q_lora_rank: int = 192
+    qk_nope_head_dim: int = 64
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 64
     rope_theta: float = 10000.0
     
-    intermediate_size: int = 256
+    intermediate_size: int = 1024
     moe_layer_freq: int = 1
     first_moe_layer: int = 1
     moe: MoEConfig = field(default_factory=MoEConfig)
