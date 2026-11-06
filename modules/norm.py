@@ -11,5 +11,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Calculate root mean square along the hidden dimension
         variance = x.pow(2).mean(dim=-1, keepdim=True)
+        # Normalize inputs and scale with learnable gain parameter
         x_norm = x * torch.rsqrt(variance + self.eps)
         return self.weight * x_norm

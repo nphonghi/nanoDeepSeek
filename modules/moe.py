@@ -22,27 +22,61 @@ class SwiGLU(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        aux_loss_free: bool = False,
+        bias_update_rate: float = 0.001,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.aux_loss_free = aux_loss_free
+        self.bias_update_rate = bias_update_rate
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
 
+        if aux_loss_free:
+            # DeepSeek-V3 dynamic bias for auxiliary-loss-free load balancing
+            self.register_buffer("expert_bias", torch.zeros(num_experts))
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Project inputs to compute raw routing logits
         flat_x = x.view(-1, x.size(-1))
         logits = self.gate(flat_x)
         probs = F.softmax(logits, dim=-1, dtype=torch.float32)
 
-        # Select top-k experts per token and re-normalize routing weights
-        topk_weights, topk_indices = torch.topk(probs, self.top_k, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(x.dtype)
+        if self.aux_loss_free:
+            # DeepSeek-V3: select top-k experts by adding dynamic load-balancing bias
+            routing_scores = probs + self.expert_bias.unsqueeze(0)
+            _, topk_indices = torch.topk(routing_scores, self.top_k, dim=-1)
 
-        # Compute auxiliary loss to encourage balanced routing across all experts
-        expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).sum(dim=1)
-        fraction_routed = expert_mask.float().mean(dim=0)
-        mean_probability = probs.mean(dim=0)
-        aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probability)
+            # Gating weights are normalized from original probabilities (without bias)
+            topk_weights = probs.gather(dim=-1, index=topk_indices)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(x.dtype)
+
+            # Update bias: decrease for overloaded experts, increase for underloaded experts
+            if self.training:
+                with torch.no_grad():
+                    expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).sum(dim=1)
+                    fraction_routed = expert_mask.float().mean(dim=0)
+                    target_load = self.top_k / self.num_experts
+                    self.expert_bias += self.bias_update_rate * (target_load - fraction_routed)
+
+            aux_loss = torch.tensor(0.0, device=x.device)
+        else:
+            # DeepSeek-V2 / Switch Transformer style auxiliary load balancing loss
+            topk_weights, topk_indices = torch.topk(probs, self.top_k, dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(x.dtype)
+
+            # Compute auxiliary loss to encourage balanced routing across all experts
+            expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).sum(dim=1)
+            fraction_routed = expert_mask.float().mean(dim=0)
+            mean_probability = probs.mean(dim=0)
+            aux_loss = self.num_experts * torch.sum(fraction_routed * mean_probability)
 
         return topk_indices, topk_weights, aux_loss
 
@@ -68,17 +102,26 @@ class DeepSeekMoE(nn.Module):
             for _ in range(self.num_experts)
         ])
 
-        self.router = MoEGate(hidden_size, self.num_experts, self.top_k)
+        # Router gate determining dynamic token-to-expert dispatch
+        self.router = MoEGate(
+            hidden_size,
+            self.num_experts,
+            self.top_k,
+            aux_loss_free=config.aux_loss_free,
+            bias_update_rate=config.bias_update_rate,
+        )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x.shape
         flat_x = x.view(-1, D)
 
+        # Compute shared experts output (always active)
         shared_out = self.shared_experts(flat_x) if self.shared_experts is not None else 0.0
 
+        # Route tokens through MoE gate
         topk_indices, topk_weights, aux_loss = self.router(flat_x)
 
-        # Dispatch tokens to selected experts and accumulate weighted outputs
+        # Dispatch tokens to selected routed experts and accumulate weighted outputs
         routed_out = torch.zeros_like(flat_x)
         for expert_id in range(self.num_experts):
             token_mask = (topk_indices == expert_id)
@@ -92,6 +135,7 @@ class DeepSeekMoE(nn.Module):
             expert_out = self.experts[expert_id](expert_tokens) * weights
             routed_out.index_add_(0, token_idx, expert_out)
 
+        # Combine shared and routed outputs with scaled auxiliary loss
         total_out = (shared_out + routed_out).view(B, L, D)
         scaled_aux_loss = self.aux_loss_weight * aux_loss
         return total_out, scaled_aux_loss

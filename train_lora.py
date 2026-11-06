@@ -17,9 +17,11 @@ from data import get_batch, vocab_size, encode, decode
 
 
 def main():
+    # Detect device and print status
     device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"))
     print(f"Fine-tuning nanoDeepSeek with LoRA on device: {device}")
 
+    # Instantiate base NanoDeepSeek model
     model_cfg = ModelConfig(
         vocab_size=vocab_size,
         hidden_size=128,
@@ -34,6 +36,14 @@ def main():
         v_head_dim=32,
     )
     model = NanoDeepSeek(model_cfg).to(device)
+
+    # Load pretrained base model checkpoint if available
+    base_checkpoint = Path(__file__).resolve().parent / "base_model.pt"
+    if base_checkpoint.exists():
+        model.load_state_dict(torch.load(base_checkpoint, map_location=device))
+        print(f"Loaded pretrained base model from {base_checkpoint.name}")
+    else:
+        print("No base model checkpoint found, starting from random initialization")
 
     print("Base model parameter count:")
     print_trainable_parameters(model)
@@ -53,6 +63,7 @@ def main():
     print("After applying LoRA and freezing base weights:")
     print_trainable_parameters(model)
 
+    # Optimize only trainable adapter parameters
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
     model.train()
     start_time = time.time()
@@ -76,6 +87,11 @@ def main():
         if hasattr(module, "merge_weights"):
             module.merge_weights()
     print("Merged LoRA weights into base model successfully")
+
+    # Save fine-tuned checkpoint for downstream inference
+    lora_checkpoint = Path(__file__).resolve().parent / "lora_model.pt"
+    torch.save(model.state_dict(), lora_checkpoint)
+    print(f"Saved fine-tuned LoRA model checkpoint to {lora_checkpoint.name}")
 
 
 if __name__ == "__main__":

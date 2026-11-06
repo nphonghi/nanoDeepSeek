@@ -1,31 +1,24 @@
 import os
 import pickle
 import urllib.request
+import array
 from pathlib import Path
-import numpy as np
 
 DATA_DIR = Path(__file__).resolve().parent
-INPUT_PATH = DATA_DIR / "input.txt"
 TRAIN_BIN_PATH = DATA_DIR / "train.bin"
 VAL_BIN_PATH = DATA_DIR / "val.bin"
 META_PATH = DATA_DIR / "meta.pkl"
-DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+DATA_URL = "https://huggingface.co/datasets/tiny_shakespeare/raw/main/tiny_shakespeare.txt"
 
 
 def prepare():
-    # Download Tiny Shakespeare dataset via Python if not already present
-    if not INPUT_PATH.exists():
-        print(f"Downloading Tiny Shakespeare from {DATA_URL} ...")
-        urllib.request.urlretrieve(DATA_URL, INPUT_PATH)
-
-    with open(INPUT_PATH, "r", encoding="utf-8") as f:
-        data = f.read()
-
-    print(f"Length of dataset in characters: {len(data):,}")
+    # Fetch corpus directly into memory without saving raw text to disk
+    print(f"Downloading Tiny Shakespeare corpus into memory from {DATA_URL} ...")
+    with urllib.request.urlopen(DATA_URL) as response:
+        data = response.read().decode("utf-8")
 
     chars = sorted(list(set(data)))
     vocab_size = len(chars)
-    print(f"Vocabulary size: {vocab_size}")
 
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
@@ -40,15 +33,14 @@ def prepare():
     train_data = data[: int(n * 0.9)]
     val_data = data[int(n * 0.9) :]
 
-    train_ids = np.array(encode(train_data), dtype=np.uint16)
-    val_ids = np.array(encode(val_data), dtype=np.uint16)
+    train_ids = array.array("H", encode(train_data))
+    val_ids = array.array("H", encode(val_data))
 
-    print(f"Train split tokens: {len(train_ids):,}")
-    print(f"Val split tokens: {len(val_ids):,}")
-
-    # Export binary token files for fast memmap loading
-    train_ids.tofile(TRAIN_BIN_PATH)
-    val_ids.tofile(VAL_BIN_PATH)
+    # Export pre-tokenized binary files directly
+    with open(TRAIN_BIN_PATH, "wb") as f:
+        train_ids.tofile(f)
+    with open(VAL_BIN_PATH, "wb") as f:
+        val_ids.tofile(f)
 
     # Save vocabulary metadata mapping characters to integers
     meta = {
@@ -58,10 +50,8 @@ def prepare():
     }
     with open(META_PATH, "wb") as f:
         pickle.dump(meta, f)
-
-    print("Data preparation completed successfully")
+    print(f"Prepared train.bin ({len(train_ids):,} tokens) and val.bin ({len(val_ids):,} tokens)")
 
 
 if __name__ == "__main__":
     prepare()
-

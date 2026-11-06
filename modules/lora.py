@@ -18,7 +18,7 @@ class LoRALinear(nn.Module):
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
 
-        # Freeze original weight matrix
+        # Freeze original base weight matrix
         self.base_layer.weight.requires_grad = False
         if self.base_layer.bias is not None:
             self.base_layer.bias.requires_grad = False
@@ -33,12 +33,14 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, r, device=device, dtype=dtype))
         self.dropout = nn.Dropout(p=lora_dropout) if lora_dropout > 0 else nn.Identity()
 
-        # Initialize A with Kaiming uniform and B with zeros
+        # Initialize matrix A with Kaiming uniform and matrix B with zeros
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute original base forward output
         base_out = self.base_layer(x)
+        # Compute low-rank adapter delta: (dropout(x) @ A^T) @ B^T * scaling
         lora_out = (self.dropout(x) @ self.lora_A.T) @ self.lora_B.T * self.scaling
         return base_out + lora_out
 
@@ -56,7 +58,7 @@ def apply_lora(
     lora_alpha: float = 16.0,
     lora_dropout: float = 0.05,
 ) -> nn.Module:
-    # Wrap target linear layers with low-rank adapters
+    # Wrap target linear projection layers with low-rank adapters
     for name, module in model.named_modules():
         for child_name, child in module.named_children():
             if isinstance(child, nn.Linear) and any(target in child_name for target in target_modules):
@@ -71,7 +73,7 @@ def apply_lora(
 
 
 def mark_only_lora_as_trainable(model: nn.Module) -> None:
-    # Freeze model weights and only enable gradients for LoRA parameters
+    # Freeze base model weights and only enable gradients for LoRA parameters
     for name, param in model.named_parameters():
         if "lora_" in name:
             param.requires_grad = True

@@ -10,6 +10,8 @@ class MoEConfig:
     num_shared_experts: int = 1
     expert_hidden_size: int = 256
     aux_loss_weight: float = 0.01
+    aux_loss_free: bool = False  # Set to True for DeepSeek-V3 auxiliary-loss-free load balancing
+    bias_update_rate: float = 0.001
 
 
 @dataclass

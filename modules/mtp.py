@@ -1,68 +1,163 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .norm import RMSNorm
+from .attention import MultiHeadLatentAttention
+from .moe import SwiGLU
+
+
+class MTPTransformerBlock(nn.Module):
+    """
+    Lightweight Transformer block dedicated to an MTP depth layer.
+    Contains pre-norm MultiHeadLatentAttention (MLA) and SwiGLU feed-forward layer.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn = MultiHeadLatentAttention(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            kv_lora_rank=config.kv_lora_rank,
+            q_lora_rank=config.q_lora_rank,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            max_seq_len=config.max_position_embeddings,
+            rope_theta=config.rope_theta,
+            dropout=config.dropout,
+        )
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn = SwiGLU(config.hidden_size, config.intermediate_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(self.attn_norm(x))
+        x = x + attn_out
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
+class MTPDepthModule(nn.Module):
+    """
+    A single Multi-Token Prediction (MTP) depth module as specified in DeepSeek-V3 (Section 3.2).
+    Combines representation h_{k-1} with embedding of token t_{i+k}, then passes through a Transformer block.
+    """
+    def __init__(self, config, depth: int):
+        super().__init__()
+        self.depth = depth
+        self.h_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.emb_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.combine_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.block = MTPTransformerBlock(config)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, h_prev: torch.Tensor, next_token_embeds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Combine normalized previous hidden state and next-token embedding
+        combined = torch.cat([self.h_norm(h_prev), self.emb_norm(next_token_embeds)], dim=-1)
+        x = self.combine_proj(combined)
+
+        # Process combined representations through dedicated MTP Transformer block
+        h_curr = self.block(x)
+
+        # Apply final RMSNorm before projection
+        normed_h = self.final_norm(h_curr)
+        return h_curr, normed_h
 
 
 class MTPHead(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        vocab_size: int,
-        num_predict_tokens: int = 1,
-        embedding_weight: Optional[nn.Parameter] = None,
-    ):
+    """
+    DeepSeek-V3 Multi-Token Prediction (MTP) architecture.
+    Maintains sequential MTP depth modules that share the word embeddings and LM head with the base model.
+    """
+    def __init__(self, config, num_predict_tokens: int = 1):
         super().__init__()
+        self.config = config
         self.num_predict_tokens = num_predict_tokens
-        
-        # Projection layers mapping current representations to future token depths
-        self.projections = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size, bias=False)
-            for _ in range(num_predict_tokens)
+        self.depth_modules = nn.ModuleList([
+            MTPDepthModule(config, depth=k)
+            for k in range(1, num_predict_tokens + 1)
         ])
-        self.norms = nn.ModuleList([
-            RMSNorm(hidden_size)
-            for _ in range(num_predict_tokens)
-        ])
-        
-        # Output heads predicting future vocabulary tokens
-        self.output_heads = nn.ModuleList([
-            nn.Linear(hidden_size, vocab_size, bias=False)
-            for _ in range(num_predict_tokens)
-        ])
-        if embedding_weight is not None:
-            for head in self.output_heads:
-                head.weight = embedding_weight
 
-    def forward(self, hidden_states: torch.Tensor) -> List[torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        embed_tokens: nn.Embedding,
+        lm_head: nn.Linear,
+    ) -> List[torch.Tensor]:
+        """
+        Forward pass during training:
+        hidden_states: [B, L, D] representations from the main model
+        input_ids: [B, L] token ids
+        """
+        # Initialize prediction list and track hidden states across sequential depths
         predictions = []
-        for i in range(self.num_predict_tokens):
-            h = self.projections[i](hidden_states)
-            h = self.norms[i](h)
-            logits = self.output_heads[i](h)
-            predictions.append(logits)
+        h_prev = hidden_states
+        B, L, _ = hidden_states.shape
+
+        # Iterate sequentially through each prediction depth k
+        for depth_idx, module in enumerate(self.depth_modules, start=1):
+            if L > depth_idx:
+                curr_h = h_prev[:, :-depth_idx, :]
+                target_token_ids = input_ids[:, depth_idx:]
+                token_embeds = embed_tokens(target_token_ids)
+                h_next, normed_h = module(curr_h, token_embeds)
+                logits = lm_head(normed_h)
+                predictions.append(logits)
+                h_prev = h_next
+            else:
+                break
+
+        # Return logits list for all prediction depths
         return predictions
+
+    def draft_next_token(
+        self,
+        h_last: torch.Tensor,
+        next_token: torch.Tensor,
+        embed_tokens: nn.Embedding,
+        lm_head: nn.Linear,
+    ) -> torch.Tensor:
+        """
+        Speculative drafting for inference (Depth 1):
+        h_last: [B, 1, D] hidden state of main model at current step
+        next_token: [B, 1] token generated by main model at current step
+        Returns: draft_token [B, 1] predicted ahead for the subsequent step
+        """
+        # Embed current generated token
+        token_embed = embed_tokens(next_token)
+
+        # Forward through MTP Depth 1 module
+        _, normed_h = self.depth_modules[0](h_last, token_embed)
+
+        # Project to vocabulary and pick greedy draft token
+        logits = lm_head(normed_h)[:, -1, :]
+        return torch.argmax(logits, dim=-1, keepdim=True)
 
     def compute_loss(
         self,
         mtp_logits_list: List[torch.Tensor],
         labels: torch.Tensor,
     ) -> torch.Tensor:
-        total_loss = 0.0
+        # Return zero loss if no MTP predictions exist
+        if not mtp_logits_list:
+            return torch.tensor(0.0, device=labels.device)
+
+        total_loss = torch.tensor(0.0, device=labels.device)
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
 
-        # Compute prediction loss for tokens at positions t+2, t+3 and beyond
+        # Accumulate cross entropy across all prediction depths with proper label shifting
         for depth, logits in enumerate(mtp_logits_list, start=1):
-            shift_logits = logits[:, :-(depth + 1), :].contiguous()
-            shift_labels = labels[:, (depth + 1):].contiguous()
-
-            if shift_logits.size(1) > 0:
+            target_labels = labels[:, (depth + 1):].contiguous()
+            valid_len = target_labels.size(1)
+            if valid_len > 0:
+                aligned_logits = logits[:, :valid_len, :].contiguous()
                 loss = loss_fct(
-                    shift_logits.view(-1, logits.size(-1)),
-                    shift_labels.view(-1)
+                    aligned_logits.view(-1, logits.size(-1)),
+                    target_labels.view(-1),
                 )
                 total_loss = total_loss + loss
 
+        # Average loss over valid MTP prediction depths
         return total_loss / max(1, len(mtp_logits_list))

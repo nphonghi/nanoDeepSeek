@@ -61,9 +61,9 @@ class MultiHeadLatentAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         B, L, D = x.shape
         
         # Compress and project query heads
@@ -74,16 +74,16 @@ class MultiHeadLatentAttention(nn.Module):
         # Split query into non-positional and positional sub-vectors
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         
-        # Compress and project keys and values
-        kv_compressed = self.kv_norm(self.kv_down_proj(x))
-        k_nope = self.k_up_proj(kv_compressed).view(B, L, self.num_heads, self.qk_nope_head_dim).transpose(1, 2)
-        v = self.v_up_proj(kv_compressed).view(B, L, self.num_heads, self.v_head_dim).transpose(1, 2)
+        # Joint low-rank compression of keys and values into latent vector c_t^{KV}
+        # In DeepSeek MLA, this compressed latent representation is the ONLY thing cached (along with decoupled RoPE key)
+        kv_compressed = self.kv_norm(self.kv_down_proj(x))  # [B, L, kv_lora_rank]
         
-        # Project decoupled positional key
-        k_rope = self.k_rope_proj(x).unsqueeze(1)
+        # Decoupled rotary key projection directly from input x (shared across all heads)
+        k_rope = self.k_rope_proj(x).unsqueeze(1)  # [B, 1, L, qk_rope_head_dim]
         
-        # Apply rotary position embeddings
-        past_len = past_key_value[0].shape[2] if past_key_value is not None else 0
+        # Rotary position embeddings
+        # Determine sequence positions based on cached past sequence length
+        past_len = past_key_value[0].shape[1] if past_key_value is not None else 0
         total_len = past_len + L
         
         cos, sin = self.rotary_emb(q_rope, total_len)
@@ -92,34 +92,50 @@ class MultiHeadLatentAttention(nn.Module):
         
         q_rope = apply_rotary_pos_emb(q_rope, cos, sin)
         k_rope = apply_rotary_pos_emb(k_rope, cos, sin)
-        k_rope = k_rope.expand(B, self.num_heads, L, self.qk_rope_head_dim)
         
-        # Reconstruct full query and key representations
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        k = torch.cat([k_nope, k_rope], dim=-1)
-        
-        # Update key-value cache during generation
+        # MLA KV CACHE: Cache ONLY the compressed latent vector and decoupled RoPE key!
+        # Memory footprint per token: (kv_lora_rank + qk_rope_head_dim) instead of 2 * num_heads * head_dim.
+        # This achieves massive memory compression (e.g. 56x in DeepSeek-V3).
         if past_key_value is not None:
-            past_k, past_v, _ = past_key_value
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-        
-        present_key_value = (k, v, kv_compressed) if use_cache else None
-        
-        # Compute scaled dot-product attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # Apply causal masking
-        if L > 1:
-            causal_mask = torch.triu(torch.full((L, total_len), float('-inf'), device=x.device), diagonal=past_len + 1)
-            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
+            past_kv, past_k_rope = past_key_value
+            cached_kv = torch.cat([past_kv, kv_compressed], dim=1)
+            cached_k_rope = torch.cat([past_k_rope, k_rope], dim=2)
+        else:
+            cached_kv = kv_compressed
+            cached_k_rope = k_rope
             
-        attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-        attn_weights = self.dropout(attn_weights)
+        present_key_value = (cached_kv, cached_k_rope) if use_cache else None
         
-        # Weighted sum of values
-        attn_out = torch.matmul(attn_weights, v)
+        # Decompress keys and values from the latent cache for attention calculation
+        k_nope = self.k_up_proj(cached_kv).view(B, total_len, self.num_heads, self.qk_nope_head_dim).transpose(1, 2)
+        v = self.v_up_proj(cached_kv).view(B, total_len, self.num_heads, self.v_head_dim).transpose(1, 2)
+        k_rope_expanded = cached_k_rope.expand(B, self.num_heads, total_len, self.qk_rope_head_dim)
+        
+        # Assemble full queries and keys: [B, num_heads, seq_len, qk_head_dim]
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope_expanded], dim=-1)
+        
+        # Scaled Dot-Product Attention with FlashAttention / PyTorch SDPA kernel
+        if L > 1 and past_len > 0:
+            # Chunked decoding with past cache: explicit causal mask
+            q_idx = torch.arange(L, device=x.device).unsqueeze(1)
+            k_idx = torch.arange(total_len, device=x.device).unsqueeze(0)
+            causal_mask = (k_idx <= (past_len + q_idx)).unsqueeze(0).unsqueeze(0)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=causal_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+        else:
+            # When L == 1 and past_len > 0: current token attends to all historical tokens (is_causal=False)
+            # When L > 1 and past_len == 0: prefill/training causal attention (is_causal=True)
+            is_causal = (L > 1) and (past_len == 0)
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                is_causal=is_causal,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+        
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.num_heads * self.v_head_dim)
-        
         out = self.o_proj(attn_out)
         return out, present_key_value

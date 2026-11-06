@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import math
 import time
 import sys
@@ -45,9 +46,16 @@ def estimate_loss(model: NanoDeepSeek, train_cfg: TrainConfig, device: torch.dev
 
 
 def train():
+    # Device selection and hardware detection
     device = get_device()
-    print(f"Training nanoDeepSeek on device: {device}")
+    device_type = "cuda" if "cuda" in str(device) else ("mps" if "mps" in str(device) else "cpu")
+    print(f"Training nanoDeepSeek on device: {device} ({device_type})")
 
+    # Mixed precision context setup (autocast)
+    ptdtype = torch.bfloat16 if (device_type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda" and ptdtype != torch.float32) else nullcontext()
+
+    # Training and model configurations
     train_cfg = TrainConfig(
         batch_size=32,
         block_size=64,
@@ -72,11 +80,12 @@ def train():
         v_head_dim=32,
     )
 
+    # Instantiate NanoDeepSeek model
     model = NanoDeepSeek(model_cfg).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total model parameters: {total_params:,}")
 
-    # Exclude 1D tensors (biases, norms, embeddings) from weight decay
+    # Optimizer configuration with parameter weight decay separation
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and ("weight" in n and "norm" not in n and "embed" not in n)]
     no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and ("bias" in n or "norm" in n or "embed" in n)]
     optimizer = AdamW([
@@ -92,27 +101,37 @@ def train():
         base_lr=train_cfg.learning_rate,
     )
 
+    # Main pretraining iteration loop
     model.train()
     start_time = time.time()
 
     for step in range(1, train_cfg.max_steps + 1):
+        t0 = time.time()
+        # Fetch training data batch
         x, y = get_batch("train", train_cfg.batch_size, train_cfg.block_size, device=str(device))
-        
-        outputs = model(x, labels=y)
-        loss = outputs["loss"]
 
-        optimizer.zero_grad()
+        # Forward pass under mixed precision context
+        with ctx:
+            outputs = model(x, labels=y)
+            loss = outputs["loss"]
+
+        # Backward pass and optimizer step with gradient clipping
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
         optimizer.step()
         scheduler.step()
 
+        # Track throughput metrics
+        dt = time.time() - t0
+        tokens_per_sec = (train_cfg.batch_size * train_cfg.block_size) / max(1e-6, dt)
+
         if step % 25 == 0:
             lr = scheduler.get_last_lr()[0]
             aux_loss = outputs["aux_loss"].item()
-            print(f"Step {step:4d}/{train_cfg.max_steps} | Loss: {loss.item():.4f} | MoE Aux: {aux_loss:.4f} | LR: {lr:.2e}", flush=True)
+            print(f"Step {step:4d}/{train_cfg.max_steps} | Loss: {loss.item():.4f} | MoE Aux: {aux_loss:.4f} | LR: {lr:.2e} | {dt*1000:.1f}ms | {tokens_per_sec:.0f} tok/s", flush=True)
 
-        # Estimate validation loss and sample output text
+        # Validation evaluation and text generation check
         if step % train_cfg.eval_interval == 0 or step == train_cfg.max_steps:
             losses = estimate_loss(model, train_cfg, device)
             print(f"Validation loss: train {losses['train']:.4f}, val {losses['val']:.4f}", flush=True)
@@ -125,6 +144,11 @@ def train():
             model.train()
 
     print(f"Training completed in {time.time() - start_time:.1f} seconds", flush=True)
+
+    # Save trained base model checkpoint for downstream fine-tuning and inference
+    checkpoint_path = Path(__file__).resolve().parent / "base_model.pt"
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"Saved base model checkpoint to {checkpoint_path.name}", flush=True)
 
 
 if __name__ == "__main__":

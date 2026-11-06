@@ -49,14 +49,14 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
         # Attention sub-layer with residual connection
         attn_out, present_kv = self.attn(self.attn_norm(x), past_key_value=past_key_value, use_cache=use_cache)
         x = x + attn_out
 
-        # Feed-forward sub-layer with residual connection
+        # Feed-forward sub-layer (MoE or dense SwiGLU) with residual connection
         if self.is_moe:
             ffn_out, aux_loss = self.ffn(self.ffn_norm(x))
         else:
@@ -85,10 +85,8 @@ class NanoDeepSeek(nn.Module):
 
         if config.mtp.enabled:
             self.mtp_head = MTPHead(
-                hidden_size=config.hidden_size,
-                vocab_size=config.vocab_size,
+                config=config,
                 num_predict_tokens=config.mtp.num_predict_tokens,
-                embedding_weight=self.embed_tokens.weight if config.tie_word_embeddings else None,
             )
         else:
             self.mtp_head = None
@@ -107,9 +105,10 @@ class NanoDeepSeek(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
     ) -> Dict[str, Any]:
+        # Look up token embeddings from input token IDs
         x = self.embed_tokens(input_ids)
 
         present_kvs = [] if use_cache else None
@@ -123,12 +122,14 @@ class NanoDeepSeek(nn.Module):
             if use_cache:
                 present_kvs.append(present_kv)
 
+        # Apply final RMSNorm and compute language model logits
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)
 
         loss = None
         mtp_logits = None
 
+        # Compute next-token prediction loss and multi-token prediction loss
         if labels is not None:
             # Shift tokens for next-token prediction
             shift_logits = logits[:, :-1, :].contiguous()
@@ -137,18 +138,29 @@ class NanoDeepSeek(nn.Module):
             lm_loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             loss = lm_loss + total_aux_loss
 
-            # Add multi-token prediction loss
+            # Add DeepSeek-V3 multi-token prediction loss
             if self.mtp_head is not None:
-                mtp_logits = self.mtp_head(hidden_states)
+                mtp_logits = self.mtp_head(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    embed_tokens=self.embed_tokens,
+                    lm_head=self.lm_head,
+                )
                 mtp_loss = self.mtp_head.compute_loss(mtp_logits, labels)
                 loss = loss + self.config.mtp.mtp_loss_weight * mtp_loss
 
         elif self.mtp_head is not None:
-            mtp_logits = self.mtp_head(hidden_states)
+            mtp_logits = self.mtp_head(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                embed_tokens=self.embed_tokens,
+                lm_head=self.lm_head,
+            )
 
         return {
             "logits": logits,
             "loss": loss,
+            "hidden_states": hidden_states,
             "mtp_logits": mtp_logits,
             "aux_loss": total_aux_loss,
             "past_key_values": present_kvs,
@@ -163,10 +175,12 @@ class NanoDeepSeek(nn.Module):
         top_k: int = 50,
         top_p: float = 0.9,
     ) -> torch.Tensor:
+        # Switch to evaluation mode and initialize state
         self.eval()
         past_key_values = None
         generated = input_ids
 
+        # Autoregressive token generation loop
         for _ in range(max_new_tokens):
             curr_input = generated[:, -1:] if past_key_values is not None else generated
             outputs = self.forward(curr_input, past_key_values=past_key_values, use_cache=True)
@@ -174,6 +188,7 @@ class NanoDeepSeek(nn.Module):
             logits = outputs["logits"][:, -1, :]
             past_key_values = outputs["past_key_values"]
 
+            # Apply temperature, top-k filtering, and nucleus (top-p) sampling
             if temperature > 0:
                 logits = logits / temperature
                 if top_k > 0:
@@ -193,6 +208,7 @@ class NanoDeepSeek(nn.Module):
             else:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
+            # Append newly generated token to ongoing sequence
             generated = torch.cat((generated, next_token), dim=1)
 
         return generated
